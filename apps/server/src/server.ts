@@ -352,16 +352,12 @@ const WorkspaceLayerLive = Layer.mergeAll(
   WorkspaceFileSystemLayerLive,
 );
 
-const GitHubAvatarResolverLayerLive = GitHubAvatarResolver.layer.pipe(
-  Layer.provide(RepositoryIdentityResolver.layer),
-);
-const ProjectFaviconResolverLayerLive = Layer.mergeAll(
-  ProjectFaviconResolver.layer.pipe(
-    Layer.provide(WorkspacePaths.layer),
-    Layer.provide(T3ProjectFileLoader.layer),
-    Layer.provide(GitHubAvatarResolverLayerLive),
+const ProjectFaviconResolverLayerLive = ProjectFaviconResolver.layer.pipe(
+  Layer.provide(WorkspacePaths.layer),
+  Layer.provide(T3ProjectFileLoader.layer),
+  Layer.provideMerge(
+    GitHubAvatarResolver.layer.pipe(Layer.provide(RepositoryIdentityResolver.layer)),
   ),
-  GitHubAvatarResolverLayerLive,
 );
 
 const AuthLayerLive = EnvironmentAuth.layer.pipe(
