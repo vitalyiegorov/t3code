@@ -40,7 +40,7 @@ const AVATAR_EXTENSIONS_BY_CONTENT_TYPE: Record<string, string> = {
   "image/png": ".png",
   "image/webp": ".webp",
 };
-const CACHED_AVATAR_EXTENSIONS = [".avif", ".gif", ".jpg", ".png", ".webp"] as const;
+const CACHED_AVATAR_EXTENSIONS = Object.values(AVATAR_EXTENSIONS_BY_CONTENT_TYPE);
 
 export class GitHubAvatarResolver extends Context.Service<
   GitHubAvatarResolver,
@@ -69,31 +69,6 @@ export const make = Effect.gen(function* () {
     return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
   };
 
-  // Reads at most MAX_AVATAR_BYTES + 1 before abandoning the body, so a
-  // response without a content-length can never buffer past the cap.
-  const readBodyCapped = Effect.fn("GitHubAvatarResolver.readBodyCapped")(function* <E>(
-    body: Stream.Stream<Uint8Array, E>,
-  ) {
-    const chunks: Array<Uint8Array> = [];
-    let total = 0;
-    yield* Stream.runForEachWhile(body, (chunk: Uint8Array) =>
-      Effect.sync(() => {
-        total += chunk.byteLength;
-        if (total > MAX_AVATAR_BYTES) return false;
-        chunks.push(chunk);
-        return true;
-      }),
-    );
-    if (total > MAX_AVATAR_BYTES) return null;
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return bytes;
-  });
-
   const downloadAvatar = Effect.fn("GitHubAvatarResolver.downloadAvatar")(function* (
     owner: string,
   ) {
@@ -105,34 +80,31 @@ export const make = Effect.gen(function* () {
     );
     if (response.status === 404) return { _tag: "negative" } as const;
     if (response.status < 200 || response.status >= 300) return { _tag: "retry" } as const;
-    const declaredBytes = Number(response.headers["content-length"] ?? Number.NaN);
-    if (Number.isFinite(declaredBytes) && declaredBytes > MAX_AVATAR_BYTES) {
-      return { _tag: "negative" } as const;
-    }
-    const bytes = yield* readBodyCapped(response.stream);
-    if (bytes === null || bytes.byteLength === 0) {
-      return { _tag: "negative" } as const;
-    }
+    // The body is read through the cap, so a response without a trustworthy
+    // content-length can never buffer past MAX_AVATAR_BYTES.
+    const chunks: Array<Uint8Array> = [];
+    let total = 0;
+    yield* Stream.runForEachWhile(response.stream, (chunk: Uint8Array) =>
+      Effect.sync(() => {
+        total += chunk.byteLength;
+        if (total > MAX_AVATAR_BYTES) return false;
+        chunks.push(chunk);
+        return true;
+      }),
+    );
+    if (total === 0 || total > MAX_AVATAR_BYTES) return { _tag: "negative" } as const;
     const contentType = (response.headers["content-type"] ?? "").split(";")[0]?.trim() ?? "";
     const extension = AVATAR_EXTENSIONS_BY_CONTENT_TYPE[contentType];
     // An unmapped type is authoritative absence: cached under a guessed
     // extension it would be served as the wrong MIME type and render broken.
     if (extension === undefined) return { _tag: "negative" } as const;
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
     return { _tag: "avatar", bytes, extension } as const;
-  });
-
-  // The miss file carries the marker epoch, so the negative TTL survives
-  // restarts and is immune to system-clock jumps between write and read.
-  const markMissing = Effect.fn("GitHubAvatarResolver.markMissing")(function* (
-    cacheKey: string,
-    markedAtMs: number,
-  ) {
-    yield* fileSystem
-      .makeDirectory(cacheDir, { recursive: true })
-      .pipe(Effect.catchCause(() => Effect.void));
-    yield* fileSystem
-      .writeFileString(path.join(cacheDir, `${cacheKey}.miss`), String(markedAtMs))
-      .pipe(Effect.catchCause(() => Effect.void));
   });
 
   const fetchAndCache = Effect.fn("GitHubAvatarResolver.fetchAndCache")(function* (
@@ -152,7 +124,11 @@ export const make = Effect.gen(function* () {
     if (outcome._tag !== "avatar") {
       if (outcome._tag === "negative") {
         transportFailureAtMs.delete(cacheKey);
-        yield* markMissing(cacheKey, now);
+        // The miss file carries the marker epoch, so the negative TTL survives
+        // restarts and is immune to clock jumps between write and read.
+        yield* fileSystem
+          .writeFileString(path.join(cacheDir, `${cacheKey}.miss`), String(now))
+          .pipe(Effect.catchCause(() => Effect.void));
       } else {
         transportFailureAtMs.set(cacheKey, now);
       }
@@ -178,9 +154,10 @@ export const make = Effect.gen(function* () {
       }
     }
     const now = yield* Clock.currentTimeMillis;
+    // A recent transport failure answers as a fresh negative: null, no fetch.
     const mutedAtMs = transportFailureAtMs.get(cacheKey);
     if (mutedAtMs !== undefined && now - mutedAtMs < TRANSPORT_FAILURE_MUTE_MS) {
-      return { _tag: "muted" } as const;
+      return { _tag: "negative" } as const;
     }
     const miss = yield* fileSystem
       .readFileString(path.join(cacheDir, `${cacheKey}.miss`))
@@ -201,8 +178,8 @@ export const make = Effect.gen(function* () {
         ? null
         : parseGitHubRepositoryNameWithOwnerFromRemoteUrl(identity.locator.remoteUrl);
     if (nameWithOwner === null) return null;
-    const [owner, name] = nameWithOwner.split("/");
-    if (!owner || !name) return null;
+    const owner = nameWithOwner.split("/")[0];
+    if (!owner) return null;
 
     // The avatar is an attribute of the owner, so every repository of that
     // owner shares one cache entry and one fetch. GitHub treats owner names
