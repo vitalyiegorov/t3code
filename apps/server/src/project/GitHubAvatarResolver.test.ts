@@ -36,7 +36,7 @@ const gitlabIdentity: RepositoryIdentity = {
 const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 const makeLayer = (input: {
-  readonly identity: RepositoryIdentity | null;
+  readonly identity: RepositoryIdentity | null | ((cwd: string) => RepositoryIdentity | null);
   readonly count: { value: number };
   readonly response: () => Response | Promise<Response>;
 }) =>
@@ -45,7 +45,10 @@ const makeLayer = (input: {
       Layer.succeed(
         RepositoryIdentityResolver.RepositoryIdentityResolver,
         RepositoryIdentityResolver.RepositoryIdentityResolver.of({
-          resolve: () => Effect.succeed(input.identity),
+          resolve: (cwd) =>
+            Effect.succeed(
+              typeof input.identity === "function" ? input.identity(cwd) : input.identity,
+            ),
         }),
       ),
     ),
@@ -121,6 +124,40 @@ describe("GitHubAvatarResolver", () => {
     );
   });
 
+  it.effect("shares one cache entry across repositories of the same owner", () => {
+    const count = { value: 0 };
+    const identities: Record<string, RepositoryIdentity> = {
+      "/worktrees/trino": identity,
+      "/worktrees/tpch": {
+        canonicalKey: "github.com/trinodb/tpch",
+        locator: {
+          source: "git-remote",
+          remoteName: "origin",
+          // Different repository and different owner casing than /worktrees/trino.
+          remoteUrl: "https://github.com/TrinoDB/tpch.git",
+        },
+      },
+    };
+    return Effect.gen(function* () {
+      const resolver = yield* GitHubAvatarResolver.GitHubAvatarResolver;
+
+      const first = yield* resolver.resolvePath("/worktrees/trino");
+      const second = yield* resolver.resolvePath("/worktrees/tpch");
+
+      expect(first).not.toBeNull();
+      expect(first).toBe(second);
+      expect(count.value).toBe(1);
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          identity: (cwd) => identities[cwd] ?? null,
+          count,
+          response: () => new Response(pngBytes, { headers: { "content-type": "image/png" } }),
+        }),
+      ),
+    );
+  });
+
   it.effect("skips non-github remotes without any request", () => {
     const count = { value: 0 };
     return Effect.gen(function* () {
@@ -182,12 +219,18 @@ describe("GitHubAvatarResolver", () => {
     );
   });
 
-  it.effect("retries transport failures without a negative marker", () => {
+  it.effect("mutes refetching briefly after a transport failure, without a negative marker", () => {
     const count = { value: 0 };
     return Effect.gen(function* () {
       const resolver = yield* GitHubAvatarResolver.GitHubAvatarResolver;
 
+      // The failure mutes further attempts, so an offline burst pays one
+      // timeout per owner instead of one per favicon request.
       expect(yield* resolver.resolvePath("/worktrees/trino")).toBeNull();
+      expect(yield* resolver.resolvePath("/worktrees/trino")).toBeNull();
+      expect(count.value).toBe(1);
+
+      yield* TestClock.adjust("6 minutes");
       expect(yield* resolver.resolvePath("/worktrees/trino")).toBeNull();
       expect(count.value).toBe(2);
     }).pipe(
@@ -201,12 +244,16 @@ describe("GitHubAvatarResolver", () => {
     );
   });
 
-  it.effect("retries rate-limited responses without a negative marker", () => {
+  it.effect("mutes rate-limited responses briefly, without a negative marker", () => {
     const count = { value: 0 };
     return Effect.gen(function* () {
       const resolver = yield* GitHubAvatarResolver.GitHubAvatarResolver;
 
       expect(yield* resolver.resolvePath("/worktrees/trino")).toBeNull();
+      expect(yield* resolver.resolvePath("/worktrees/trino")).toBeNull();
+      expect(count.value).toBe(1);
+
+      yield* TestClock.adjust("6 minutes");
       expect(yield* resolver.resolvePath("/worktrees/trino")).toBeNull();
       expect(count.value).toBe(2);
     }).pipe(
@@ -235,6 +282,26 @@ describe("GitHubAvatarResolver", () => {
           identity,
           count,
           response: () => new Response(pngBytes, { headers: { "content-type": "image/jpeg" } }),
+        }),
+      ),
+    );
+  });
+
+  it.effect("remembers unservable content types as negative", () => {
+    const count = { value: 0 };
+    return Effect.gen(function* () {
+      const resolver = yield* GitHubAvatarResolver.GitHubAvatarResolver;
+
+      expect(yield* resolver.resolvePath("/worktrees/trino")).toBeNull();
+      expect(yield* resolver.resolvePath("/worktrees/trino")).toBeNull();
+      expect(count.value).toBe(1);
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          identity,
+          count,
+          response: () =>
+            new Response(pngBytes, { headers: { "content-type": "application/octet-stream" } }),
         }),
       ),
     );

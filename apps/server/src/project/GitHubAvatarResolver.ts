@@ -1,7 +1,7 @@
 /**
  * GitHubAvatarResolver - the last step of project icon discovery: the avatar
  * of a github.com repository owner, for projects no local icon covers.
- * One fetch per owner per repository ever; every failure resolves to null.
+ * One fetch per owner ever; every failure resolves to null.
  */
 import { parseGitHubRepositoryNameWithOwnerFromRemoteUrl } from "@t3tools/shared/git";
 import * as Clock from "effect/Clock";
@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 import * as ServerConfig from "../config.ts";
@@ -21,15 +22,25 @@ import * as RepositoryIdentityResolver from "./RepositoryIdentityResolver.ts";
 
 const FETCH_TIMEOUT_MS = 5_000;
 const MAX_AVATAR_BYTES = 1024 * 1024;
-/** A repository with no avatar is remembered this long before one retry. */
+/** An owner with no avatar is remembered this long before one retry. */
 const NEGATIVE_RESULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * A transport failure mutes further fetch attempts for this long, in memory
+ * only. An offline machine then pays the connect timeout once per owner, not
+ * once per favicon request, and recovers the moment the process restarts or
+ * the window lapses.
+ */
+const TRANSPORT_FAILURE_MUTE_MS = 5 * 60 * 1000;
+// The asset route serves these files with their extension as the MIME type
+// under nosniff, so only types the clients can render may enter the cache.
 const AVATAR_EXTENSIONS_BY_CONTENT_TYPE: Record<string, string> = {
+  "image/avif": ".avif",
   "image/gif": ".gif",
   "image/jpeg": ".jpg",
   "image/png": ".png",
   "image/webp": ".webp",
 };
-const CACHED_AVATAR_EXTENSIONS = [".gif", ".jpg", ".jpeg", ".png", ".webp"] as const;
+const CACHED_AVATAR_EXTENSIONS = [".avif", ".gif", ".jpg", ".png", ".webp"] as const;
 
 export class GitHubAvatarResolver extends Context.Service<
   GitHubAvatarResolver,
@@ -49,6 +60,7 @@ export const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
   const repositoryIdentityResolver = yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
   const semaphore = yield* Semaphore.make(1);
+  const transportFailureAtMs = new Map<string, number>();
 
   const cacheDir = path.join(config.stateDir, "github-avatars");
 
@@ -57,11 +69,36 @@ export const make = Effect.gen(function* () {
     return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
   };
 
+  // Reads at most MAX_AVATAR_BYTES + 1 before abandoning the body, so a
+  // response without a content-length can never buffer past the cap.
+  const readBodyCapped = Effect.fn("GitHubAvatarResolver.readBodyCapped")(function* <E>(
+    body: Stream.Stream<Uint8Array, E>,
+  ) {
+    const chunks: Array<Uint8Array> = [];
+    let total = 0;
+    yield* Stream.runForEachWhile(body, (chunk: Uint8Array) =>
+      Effect.sync(() => {
+        total += chunk.byteLength;
+        if (total > MAX_AVATAR_BYTES) return false;
+        chunks.push(chunk);
+        return true;
+      }),
+    );
+    if (total > MAX_AVATAR_BYTES) return null;
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  });
+
   const downloadAvatar = Effect.fn("GitHubAvatarResolver.downloadAvatar")(function* (
     owner: string,
   ) {
     // github.com/<owner>.png is the avatar the repository page itself displays;
-    // it is not the rate-limited API. A 404 means private or nonexistent; any
+    // it is not the rate-limited API. A 404 means the owner does not exist; any
     // other non-2xx is transient and must retry on a later request.
     const response = yield* httpClient.execute(
       HttpClientRequest.get(`https://github.com/${encodeURIComponent(owner)}.png`),
@@ -72,16 +109,16 @@ export const make = Effect.gen(function* () {
     if (Number.isFinite(declaredBytes) && declaredBytes > MAX_AVATAR_BYTES) {
       return { _tag: "negative" } as const;
     }
-    const bytes = new Uint8Array(yield* response.arrayBuffer);
-    if (bytes.byteLength === 0 || bytes.byteLength > MAX_AVATAR_BYTES) {
+    const bytes = yield* readBodyCapped(response.stream);
+    if (bytes === null || bytes.byteLength === 0) {
       return { _tag: "negative" } as const;
     }
     const contentType = (response.headers["content-type"] ?? "").split(";")[0]?.trim() ?? "";
-    return {
-      _tag: "avatar",
-      bytes,
-      extension: AVATAR_EXTENSIONS_BY_CONTENT_TYPE[contentType] ?? ".png",
-    } as const;
+    const extension = AVATAR_EXTENSIONS_BY_CONTENT_TYPE[contentType];
+    // An unmapped type is authoritative absence: cached under a guessed
+    // extension it would be served as the wrong MIME type and render broken.
+    if (extension === undefined) return { _tag: "negative" } as const;
+    return { _tag: "avatar", bytes, extension } as const;
   });
 
   // The miss file carries the marker epoch, so the negative TTL survives
@@ -114,10 +151,14 @@ export const make = Effect.gen(function* () {
     );
     if (outcome._tag !== "avatar") {
       if (outcome._tag === "negative") {
+        transportFailureAtMs.delete(cacheKey);
         yield* markMissing(cacheKey, now);
+      } else {
+        transportFailureAtMs.set(cacheKey, now);
       }
       return null;
     }
+    transportFailureAtMs.delete(cacheKey);
     const targetPath = path.join(cacheDir, `${cacheKey}${outcome.extension}`);
     const temporaryPath = `${targetPath}.tmp`;
     const written = yield* fileSystem.writeFile(temporaryPath, outcome.bytes).pipe(Effect.option);
@@ -136,12 +177,16 @@ export const make = Effect.gen(function* () {
         return { _tag: "hit", path: cachedPath } as const;
       }
     }
+    const now = yield* Clock.currentTimeMillis;
+    const mutedAtMs = transportFailureAtMs.get(cacheKey);
+    if (mutedAtMs !== undefined && now - mutedAtMs < TRANSPORT_FAILURE_MUTE_MS) {
+      return { _tag: "muted" } as const;
+    }
     const miss = yield* fileSystem
       .readFileString(path.join(cacheDir, `${cacheKey}.miss`))
       .pipe(Effect.option);
     if (Option.isSome(miss)) {
       const markedAtMs = Number(miss.value);
-      const now = yield* Clock.currentTimeMillis;
       if (Number.isFinite(markedAtMs) && now - markedAtMs < NEGATIVE_RESULT_TTL_MS) {
         return { _tag: "negative" } as const;
       }
@@ -159,11 +204,15 @@ export const make = Effect.gen(function* () {
     const [owner, name] = nameWithOwner.split("/");
     if (!owner || !name) return null;
 
-    const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(nameWithOwner));
+    // The avatar is an attribute of the owner, so every repository of that
+    // owner shares one cache entry and one fetch. GitHub treats owner names
+    // case-insensitively; remotes disagree on casing, the key must not.
+    const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(owner.toLowerCase()));
     const cacheKey = Encoding.encodeHex(digest);
 
-    // Hits and fresh negatives answer without the permit, so a reconnect burst
-    // of already-cached projects never queues behind a slow first fetch (#7536).
+    // Hits, fresh negatives and muted failures answer without the permit, so a
+    // reconnect burst of already-cached projects never queues behind a slow
+    // first fetch (#7536).
     const fast = yield* cachedAvatar(cacheKey);
     if (fast._tag !== "miss") return fast._tag === "hit" ? fast.path : null;
     const decided = Effect.gen(function* () {
