@@ -50,3 +50,15 @@ export const makeClaudeCapabilitiesCacheKey = Effect.fn("makeClaudeCapabilitiesC
     return `${config.binaryPath}\0${resolvedHomePath}\0${cwd ?? ""}`;
   },
 );
+
+/**
+ * Login hint for a Claude CLI whose OAuth session expired. Names the
+ * instance's config dir so multi-instance setups log back into the same one
+ * the adapter spawns against.
+ */
+export const claudeSignedOutMessage = (config: Pick<ClaudeSettings, "homePath">): string => {
+  const homePath = config.homePath.trim();
+  return `Claude is signed out: its login session expired. Run \`${
+    homePath ? `CLAUDE_CONFIG_DIR=${homePath} ` : ""
+  }claude auth login\` in a terminal, then send the message again.`;
+};

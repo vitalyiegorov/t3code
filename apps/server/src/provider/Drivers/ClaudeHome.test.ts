@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
 
 import {
+  claudeSignedOutMessage,
   makeClaudeCapabilitiesCacheKey,
   makeClaudeContinuationGroupKey,
   makeClaudeEnvironment,
@@ -38,6 +39,13 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
         );
       }),
     );
+
+    it("points the signed-out hint at the configured Claude home", () => {
+      expect(claudeSignedOutMessage({ homePath: "" })).toContain("Run `claude auth login`");
+      expect(claudeSignedOutMessage({ homePath: "~/.claude-work" })).toContain(
+        "Run `CLAUDE_CONFIG_DIR=~/.claude-work claude auth login`",
+      );
+    });
 
     it.effect("separates capability probes by cwd", () =>
       Effect.gen(function* () {

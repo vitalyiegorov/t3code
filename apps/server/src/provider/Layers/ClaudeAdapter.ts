@@ -83,7 +83,7 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
-import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
+import { claudeSignedOutMessage, makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import { planClaudeSkillDispatch } from "../Drivers/ClaudeSkillDispatch.ts";
 import { discoverClaudeSkills } from "../Drivers/ClaudeSkills.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
@@ -159,6 +159,12 @@ interface ClaudeTurnState {
   compactedSinceLatestAssistantUsage: boolean;
   hasSubagents: boolean;
   nextSyntheticAssistantBlockIndex: number;
+  /**
+   * Real cause latched mid-turn (expired login, rejected usage window). The
+   * CLI ends such turns with a generic API error, so the result handler
+   * reports this instead.
+   */
+  failureMessage: string | undefined;
 }
 
 interface AssistantTextBlockState {
@@ -3184,6 +3190,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         compactedSinceLatestAssistantUsage: false,
         hasSubagents: false,
         nextSyntheticAssistantBlockIndex: -1,
+        failureMessage: undefined,
       };
       context.session = {
         ...context.session,
@@ -3242,6 +3249,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
 
     if (context.turnState) {
+      // The CLI reports an expired login as a synthetic assistant message and
+      // then ends the turn as a plain API error, so latch the real cause here.
+      if (message.error === "authentication_failed") {
+        context.turnState.failureMessage = claudeSignedOutMessage(claudeSettings);
+      }
       context.turnState.items.push(message.message);
       if (
         normalizeClaudeActiveTokenUsage(
@@ -3268,8 +3280,20 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return;
     }
 
-    const status = turnStatusFromResult(message);
-    const errorMessage = resultUserFacingError(message);
+    let status = turnStatusFromResult(message);
+    let errorMessage = resultUserFacingError(message);
+
+    // A turn that already reported its real cause ends as a generic API error,
+    // or as a success flagged is_error. Any other outcome names itself.
+    const failureMessage = context.turnState?.failureMessage;
+    if (
+      failureMessage !== undefined &&
+      (message.terminal_reason === "api_error" ||
+        (status === "completed" && message.is_error === true))
+    ) {
+      status = "failed";
+      errorMessage = failureMessage;
+    }
 
     if (status === "failed") {
       yield* emitRuntimeError(context, errorMessage ?? "Claude turn failed.");
@@ -3898,6 +3922,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             names,
           );
           yield* emitRuntimeWarning(context, notice, rateLimitInfo);
+          // The CLI may still end the parked turn as a generic API error. The
+          // wait is left out: it was computed when the window rejected.
+          context.turnState.failureMessage =
+            "Claude usage limit reached. Send the message again once the limit resets.";
         }
       }
       return;
@@ -4937,6 +4965,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         compactedSinceLatestAssistantUsage: false,
         hasSubagents: false,
         nextSyntheticAssistantBlockIndex: -1,
+        failureMessage: undefined,
       };
 
       const updatedAt = yield* nowIso;
