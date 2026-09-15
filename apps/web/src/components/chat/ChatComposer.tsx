@@ -986,10 +986,12 @@ const extendReplacementRangeForTrailingSpace = (
   return text[rangeEnd] === " " ? rangeEnd + 1 : rangeEnd;
 };
 
-function useRestingComposerControlsLayout(host: HTMLDivElement | null) {
+function useRestingComposerControlsLayout(host: HTMLDivElement | null, menulessTrailingCount = 0) {
   const controlsRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef(host);
   hostRef.current = host;
+  const menulessTrailingCountRef = useRef(menulessTrailingCount);
+  menulessTrailingCountRef.current = menulessTrailingCount;
   const [layout, setLayout] = useState({ hiddenCount: 0, visible: true });
 
   const measure = useCallback(() => {
@@ -1006,6 +1008,7 @@ function useRestingComposerControlsLayout(host: HTMLDivElement | null) {
     setLayout((current) => {
       const next = resolveRestingComposerControlsLayout({
         ...measurement,
+        menulessTrailingCount: menulessTrailingCountRef.current,
         hostWidth,
         previous: current,
       });
@@ -2592,11 +2595,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     isComposerOwned: true,
   } satisfies Parameters<typeof renderProviderTraitsPicker>[0];
   const providerTraitsPicker = renderProviderTraitsPicker(providerTraitsPickerInput);
+  // The block only exists when there is a reading to draw, so an unsupported
+  // provider leaves no separator hanging in the footer. It is also the one
+  // trailing block with no overflow menu entry, which the layout needs to know.
+  const showUsageLimitsMeter =
+    settings.usageLimitsMeterEnabled && usageLimitsMeterWindow(props.usageLimits) !== null;
   const {
     controlsRef: restingComposerControlsRef,
     hiddenBlockCount: restingControlsHiddenBlockCount,
     controlsVisible: restingControlsVisible,
-  } = useRestingComposerControlsLayout(restingControlsHost);
+  } = useRestingComposerControlsLayout(restingControlsHost, showUsageLimitsMeter ? 1 : 0);
   const pendingPrimaryAction = useMemo(
     () =>
       activePendingProgress
@@ -4842,10 +4850,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   ]);
 
   const restingHiddenBlockCount = composerControlsInStrip ? restingControlsHiddenBlockCount : 0;
-  // The block only exists when there is a reading to draw, so an unsupported
-  // provider leaves no separator hanging in the footer.
-  const showUsageLimitsMeter =
-    settings.usageLimitsMeterEnabled && usageLimitsMeterWindow(props.usageLimits) !== null;
   const composerControlsCompact = !composerControlsInStrip && isComposerFooterCompact;
   // Which blocks the footer would render, in order, so each block's own
   // `hidden` prop and the overflow menu read the same slice.
